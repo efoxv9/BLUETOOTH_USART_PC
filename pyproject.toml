@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "usart-keyboard"
+version = "1.0.0"
+description = "USB-USART 键盘转发器 & 串口调试助手"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+usart-keyboard = "usart_keyboard:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pyinstaller]
+# pyinstaller src/usart_keyboard/__main__.py --onefile --windowed --name USART_Keyboard

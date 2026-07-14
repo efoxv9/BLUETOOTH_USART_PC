@@ -1,0 +1,551 @@
+# -*- coding: utf-8 -*-
+"""
+USB-USART 键盘转发器 / 串口调试助手
+====================================
+
+功能:
+  1) 键盘转发模式 —— 在发送区打字，按键内容立即逐字节转发到串口
+  2) 串口调试模式 —— 显示接收数据，支持 HEX / ASCII 切换
+  3) 完整串口参数配置 —— 数据位 / 校验位 / 停止位 / 波特率
+
+运行:
+  pip install pyserial
+  python usart_keyboard.py
+
+打包:
+  pip install pyinstaller
+  pyinstaller --onefile --windowed --name USART_Keyboard usart_keyboard.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import time
+import serial
+import serial.tools.list_ports
+
+# ═══════════════════════════════════════════════════════════════
+# 常量定义
+# ═══════════════════════════════════════════════════════════════
+
+# 非字符键 —— 按下时不产生可打印字符，直接忽略
+_MODIFIER_KEYS = {
+    "Shift_L", "Shift_R", "Control_L", "Control_R",
+    "Alt_L", "Alt_R", "Caps_Lock", "Num_Lock", "Scroll_Lock",
+    "Super_L", "Super_R", "Menu", "Multi_key",
+}
+_NAV_KEYS = {
+    "Home", "End", "Up", "Down", "Left", "Right",
+    "Prior", "Next", "Insert", "Delete",
+}
+_FUNC_KEYS = {f"F{i}" for i in range(1, 13)}
+_SKIP_KEYS = _MODIFIER_KEYS | _NAV_KEYS | _FUNC_KEYS
+
+# 串口参数枚举值（PySerial 对应的常量值）
+DATA_BITS_OPTS = [
+    ("5", serial.FIVEBITS),
+    ("6", serial.SIXBITS),
+    ("7", serial.SEVENBITS),
+    ("8", serial.EIGHTBITS),
+]
+PARITY_OPTS = [
+    ("None",  serial.PARITY_NONE),
+    ("Odd",   serial.PARITY_ODD),
+    ("Even",  serial.PARITY_EVEN),
+    ("Mark",  serial.PARITY_MARK),
+    ("Space", serial.PARITY_SPACE),
+]
+STOP_BITS_OPTS = [
+    ("1",   serial.STOPBITS_ONE),
+    ("1.5", serial.STOPBITS_ONE_POINT_FIVE),
+    ("2",   serial.STOPBITS_TWO),
+]
+
+# ═══════════════════════════════════════════════════════════════
+# 主应用类
+# ═══════════════════════════════════════════════════════════════
+
+class USARTKeyboardApp:
+    """USB-USART 键盘转发器 / 串口调试助手 主窗口。"""
+
+    BAUD_PRESETS = [
+        "9600", "19200", "38400", "57600",
+        "115200", "230400", "460800", "921600",
+    ]
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("USB-USART 键盘转发器 & 串口调试助手")
+        self.root.geometry("820x620")
+        self.root.minsize(640, 480)
+
+        # ---- 串口相关状态 ----
+        self.serial_port: serial.Serial | None = None
+        self._is_open = False
+
+        # 接收线程控制
+        self._rx_active = False
+        self._rx_thread: threading.Thread | None = None
+
+        # 接收数据原始缓冲区（用于 HEX 显示时无法解码的字节）
+        self._rx_buffer = bytearray()
+
+        # ---- 构建界面 ----
+        self._build_ui()
+        self.refresh_ports()
+
+        # 窗口关闭时确保串口释放、线程退出
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ══════════════════════════════════════════════════════════
+    # 界面构建
+    # ══════════════════════════════════════════════════════════
+
+    def _build_ui(self) -> None:
+        """构建完整的用户界面（四行结构）。"""
+
+        # ============================
+        # 第一行：串口参数配置栏
+        # ============================
+        cfg = ttk.Frame(self.root, padding=6)
+        cfg.pack(fill=tk.X)
+
+        # COM 端口
+        ttk.Label(cfg, text="COM:").pack(side=tk.LEFT)
+        self.port_var = tk.StringVar()
+        self.port_cb = ttk.Combobox(cfg, textvariable=self.port_var,
+                                    width=22, state="readonly")
+        self.port_cb.pack(side=tk.LEFT, padx=3)
+
+        # 波特率
+        ttk.Label(cfg, text="  波特率:").pack(side=tk.LEFT)
+        self.baud_var = tk.StringVar(value="115200")
+        self.baud_cb = ttk.Combobox(cfg, textvariable=self.baud_var,
+                                    values=self.BAUD_PRESETS, width=9,
+                                    state="readonly")
+        self.baud_cb.pack(side=tk.LEFT, padx=3)
+
+        # 数据位
+        ttk.Label(cfg, text="  数据位:").pack(side=tk.LEFT)
+        self.data_var = tk.StringVar(value="8")
+        self.data_cb = ttk.Combobox(cfg, textvariable=self.data_var,
+                                    values=[o[0] for o in DATA_BITS_OPTS],
+                                    width=4, state="readonly")
+        self.data_cb.pack(side=tk.LEFT, padx=3)
+
+        # 校验位
+        ttk.Label(cfg, text="  校验:").pack(side=tk.LEFT)
+        self.parity_var = tk.StringVar(value="None")
+        self.parity_cb = ttk.Combobox(cfg, textvariable=self.parity_var,
+                                      values=[o[0] for o in PARITY_OPTS],
+                                      width=6, state="readonly")
+        self.parity_cb.pack(side=tk.LEFT, padx=3)
+
+        # 停止位
+        ttk.Label(cfg, text="  停止位:").pack(side=tk.LEFT)
+        self.stop_var = tk.StringVar(value="1")
+        self.stop_cb = ttk.Combobox(cfg, textvariable=self.stop_var,
+                                    values=[o[0] for o in STOP_BITS_OPTS],
+                                    width=4, state="readonly")
+        self.stop_cb.pack(side=tk.LEFT, padx=3)
+
+        # ============================
+        # 第二行：操作按钮 + 状态
+        # ============================
+        ctrl = ttk.Frame(self.root, padding=(6, 0, 6, 4))
+        ctrl.pack(fill=tk.X)
+
+        ttk.Button(ctrl, text="🔄 刷新", command=self.refresh_ports).pack(
+            side=tk.LEFT, padx=2)
+
+        self.toggle_btn = ttk.Button(ctrl, text="打开连接",
+                                     command=self.toggle_connection)
+        self.toggle_btn.pack(side=tk.LEFT, padx=4)
+
+        # 状态
+        self.status_var = tk.StringVar(value="● 未连接")
+        self.status_lbl = ttk.Label(ctrl, textvariable=self.status_var,
+                                    foreground="red", font=("", 10, "bold"))
+        self.status_lbl.pack(side=tk.LEFT, padx=12)
+
+        # 接收计数
+        self.rx_count_var = tk.StringVar(value="RX: 0 字节")
+        ttk.Label(ctrl, textvariable=self.rx_count_var,
+                  foreground="gray").pack(side=tk.RIGHT, padx=6)
+
+        # ============================
+        # 第三行：发送区
+        # ============================
+        send_frame = ttk.LabelFrame(self.root, text="发送区", padding=4)
+        send_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
+
+        # 发送文本区 （按键即转发）
+        self.send_text = tk.Text(send_frame, wrap=tk.WORD,
+                                 font=("Consolas", 12),
+                                 height=6,
+                                 relief=tk.SUNKEN, borderwidth=2)
+        self.send_text.pack(fill=tk.BOTH, expand=True)
+        self.send_text.bind("<KeyPress>", self._on_key_press)
+        self.send_text.bind("<KeyRelease>", self._on_key_release)
+
+        # 发送选项栏
+        send_opts = ttk.Frame(send_frame)
+        send_opts.pack(fill=tk.X, pady=(4, 0))
+
+        self.hex_send_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(send_opts, text="HEX 发送",
+                        variable=self.hex_send_var).pack(side=tk.LEFT)
+
+        ttk.Label(send_opts, text="  |  输入 HEX 字节（空格分隔）:"
+                  ).pack(side=tk.LEFT, padx=(10, 4))
+        self.hex_entry = tk.Entry(send_opts, width=30)
+        self.hex_entry.pack(side=tk.LEFT)
+        self.hex_entry.bind("<Return>", self._send_hex_entry)
+        ttk.Button(send_opts, text="发送 HEX",
+                   command=self._send_hex_entry).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(send_opts, text="  (发送区直接打字即转发) ",
+                  foreground="gray", font=("", 9)).pack(side=tk.RIGHT)
+
+        # ============================
+        # 第四行：接收区
+        # ============================
+        rx_frame = ttk.LabelFrame(self.root, text="接收区", padding=4)
+        rx_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 6))
+
+        # 接收显示栏
+        rx_display_opts = ttk.Frame(rx_frame)
+        rx_display_opts.pack(fill=tk.X)
+
+        self.hex_rx_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rx_display_opts, text="HEX 显示",
+                        variable=self.hex_rx_var,
+                        command=self._toggle_rx_display).pack(side=tk.LEFT)
+
+        self.pause_rx_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rx_display_opts, text="暂停滚动",
+                        variable=self.pause_rx_var).pack(side=tk.LEFT, padx=10)
+
+        ttk.Button(rx_display_opts, text="清空接收",
+                   command=self._clear_rx).pack(side=tk.RIGHT)
+
+        # 接收文本
+        self.rx_text = tk.Text(rx_frame, wrap=tk.WORD,
+                               font=("Consolas", 11),
+                               height=10,
+                               relief=tk.SUNKEN, borderwidth=2)
+        self.rx_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        # 接收区只读
+        self.rx_text.bind("<KeyPress>", lambda e: "break")
+
+        # 底部提示
+        ttk.Label(self.root,
+                  text="提示：发送区内每个按键立即转发；接收区实时显示设备回传数据",
+                  foreground="gray", font=("", 9)).pack(pady=(0, 4))
+
+    # ══════════════════════════════════════════════════════════
+    # 串口枚举
+    # ══════════════════════════════════════════════════════════
+
+    def refresh_ports(self) -> None:
+        """枚举系统可用串口，填入下拉框。"""
+        ports = serial.tools.list_ports.comports()
+        items = [f"{p.device} — {p.description}" for p in ports]
+        self.port_cb["values"] = items
+        if items:
+            self.port_cb.current(0)
+        else:
+            self.port_var.set("")
+
+    # ══════════════════════════════════════════════════════════
+    # 串口连接管理
+    # ══════════════════════════════════════════════════════════
+
+    def _get_serial_params(self) -> dict | None:
+        """从界面控件读取并校验串口参数，返回参数字典或 None。"""
+        raw = self.port_var.get()
+        if not raw:
+            messagebox.showwarning("提示", "请先选择一个 COM 端口")
+            return None
+        port = raw.split(" — ")[0] if " — " in raw else raw.split(" - ")[0]
+
+        try:
+            baud = int(self.baud_var.get())
+        except ValueError:
+            messagebox.showwarning("提示", "波特率格式不正确")
+            return None
+
+        # 数据位
+        data_str = self.data_var.get()
+        for label, val in DATA_BITS_OPTS:
+            if label == data_str:
+                data_bits = val
+                break
+        else:
+            data_bits = serial.EIGHTBITS
+
+        # 校验位
+        parity_str = self.parity_var.get()
+        for label, val in PARITY_OPTS:
+            if label == parity_str:
+                parity = val
+                break
+        else:
+            parity = serial.PARITY_NONE
+
+        # 停止位
+        stop_str = self.stop_var.get()
+        for label, val in STOP_BITS_OPTS:
+            if label == stop_str:
+                stop_bits = val
+                break
+        else:
+            stop_bits = serial.STOPBITS_ONE
+
+        return {
+            "port":      port,
+            "baudrate":  baud,
+            "bytesize":  data_bits,
+            "parity":    parity,
+            "stopbits":  stop_bits,
+            "timeout":   0.05,           # 接收超时 50ms，保证界面响应
+        }
+
+    def toggle_connection(self) -> None:
+        if self._is_open:
+            self._close_serial()
+        else:
+            self._open_serial()
+
+    def _open_serial(self) -> None:
+        """用当前界面参数打开串口，并启动接收线程。"""
+        params = self._get_serial_params()
+        if params is None:
+            return
+
+        try:
+            self.serial_port = serial.Serial(**params)
+        except Exception as exc:
+            messagebox.showerror("连接失败", f"无法打开串口:\n{exc}")
+            return
+
+        self._is_open = True
+        self._rx_active = True
+
+        # 界面状态切换
+        self._set_ui_connected(True)
+        self._set_config_widgets_state(tk.DISABLED)
+        self.toggle_btn.config(text="关闭连接")
+        self.status_var.set(f"● 已连接 — {params['port']} @ {params['baudrate']}")
+        self.status_lbl.config(foreground="green")
+        self.send_text.focus_set()
+
+        # 启动接收线程
+        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self._rx_thread.start()
+
+    def _close_serial(self) -> None:
+        """停止接收线程并关闭串口。"""
+        self._rx_active = False
+        if self._rx_thread:
+            self._rx_thread.join(timeout=1)
+            self._rx_thread = None
+
+        if self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
+        self.serial_port = None
+        self._is_open = False
+
+        self._set_ui_connected(False)
+        self._set_config_widgets_state(tk.NORMAL)
+        self.toggle_btn.config(text="打开连接")
+        self.status_var.set("● 未连接")
+        self.status_lbl.config(foreground="red")
+
+    def _set_config_widgets_state(self, state: str) -> None:
+        """启用/禁用配置控件（连接时禁止修改参数，防止冲突）。"""
+        self.port_cb.config(state=state)
+        self.baud_cb.config(state=state)
+        self.data_cb.config(state=state)
+        self.parity_cb.config(state=state)
+        self.stop_cb.config(state=state)
+
+    def _set_ui_connected(self, connected: bool) -> None:
+        """连接状态变化时的界面颜色标记。"""
+        if connected:
+            self.send_text.config(foreground="black", background="white")
+        else:
+            self.send_text.config(foreground="gray", background="#f5f5f5")
+
+    # ══════════════════════════════════════════════════════════
+    # 接收线程
+    # ══════════════════════════════════════════════════════════
+
+    def _rx_loop(self) -> None:
+        """后台线程：循环读取串口数据并追加到接收区。"""
+        total_bytes = 0
+        while self._rx_active and self.serial_port and self.serial_port.is_open:
+            try:
+                # 检查是否有数据等待读取
+                if self.serial_port.in_waiting > 0:
+                    data = self.serial_port.read(self.serial_port.in_waiting)
+                    if data:
+                        total_bytes += len(data)
+                        # 通过主线程安全地将数据显示到界面
+                        self.root.after(0, self._append_rx_data, data)
+                        self.root.after(0, self._update_rx_count, total_bytes)
+                else:
+                    # 没有数据时短暂休眠，避免忙等导致 CPU 100%
+                    time.sleep(0.01)
+            except Exception:
+                # 串口异常断开 → 回到主线程关闭连接
+                self.root.after(0, self._close_serial)
+                break
+
+    def _append_rx_data(self, data: bytes) -> None:
+        """将接收到的字节追加到接收区（由主线程调用）。"""
+        if self.hex_rx_var.get():
+            # HEX 显示模式：将每个字节显示为两位十六进制
+            hex_str = " ".join(f"{b:02X}" for b in data) + " "
+            self.rx_text.insert(tk.END, hex_str)
+        else:
+            # ASCII 显示模式：尝试用 UTF-8 解码，无法解码的字节用转义显示
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                # 部分字节无法解码 → 逐个字符处理，非法字节显示为 \xXX
+                text = ""
+                for b in data:
+                    try:
+                        text += bytes([b]).decode("utf-8")
+                    except UnicodeDecodeError:
+                        text += f"\\x{b:02X}"
+            self.rx_text.insert(tk.END, text)
+
+        # 自动滚动到底部（除非用户勾选了"暂停滚动"）
+        if not self.pause_rx_var.get():
+            self.rx_text.see(tk.END)
+
+    def _update_rx_count(self, count: int) -> None:
+        """更新接收字节计数。"""
+        self.rx_count_var.set(f"RX: {count} 字节")
+
+    def _toggle_rx_display(self) -> None:
+        """HEX 显示切换时刷新当前接收区的内容。"""
+        # 这个功能需要重新解码原始数据，比较复杂。
+        # 简化方案：切换后只影响之后新接收的数据，已经显示的不变。
+        pass
+
+    def _clear_rx(self) -> None:
+        """清空接收区。"""
+        self.rx_text.delete("1.0", tk.END)
+        self.rx_count_var.set("RX: 0 字节")
+
+    # ══════════════════════════════════════════════════════════
+    # 键盘事件处理（即按即发）
+    # ══════════════════════════════════════════════════════════
+
+    def _on_key_press(self, event: tk.Event) -> None:
+        """按键按下事件：字符立即转发到串口。"""
+        if not self._is_open or self.serial_port is None:
+            return
+
+        # 特殊功能键
+        if event.keysym == "Return":
+            # Enter 键：发送 \r\n
+            self._serial_write(b"\r\n")
+            return
+        if event.keysym == "Tab":
+            self._serial_write(b"\t")
+            return
+        if event.keysym == "Escape":
+            self._serial_write(b"\x1b")
+            return
+        if event.keysym == "BackSpace":
+            self._serial_write(b"\x08")
+            return
+
+        # 跳过修饰键 / 功能键 / 导航键
+        if event.keysym in _SKIP_KEYS or len(event.char) == 0:
+            return
+
+        # 普通字符
+        if self.hex_send_var.get():
+            # HEX 发送模式：将字符当作十六进制解析
+            # 但打字即时转发模式下 HEX 有点矛盾，这里忽略 HEX 勾选
+            # 仍然发送 ASCII，HEX 发送走下面的专用入口
+            self._serial_write(event.char.encode("utf-8"))
+        else:
+            self._serial_write(event.char.encode("utf-8"))
+
+    def _on_key_release(self, event: tk.Event) -> None:
+        """键释放事件（目前仅用于阻止 BackSpace 删除文本，不做特殊处理）。"""
+        pass
+
+    def _serial_write(self, data: bytes) -> None:
+        """安全地写入串口，失败时自动关闭连接。"""
+        try:
+            self.serial_port.write(data)
+        except Exception:
+            self._close_serial()
+
+    # ══════════════════════════════════════════════════════════
+    # HEX 发送入口
+    # ══════════════════════════════════════════════════════════
+
+    def _send_hex_entry(self, event: tk.Event | None = None) -> None:
+        """从 HEX 输入框读取十六进制字符串并发送。"""
+        if not self._is_open or self.serial_port is None:
+            messagebox.showwarning("提示", "请先打开串口连接")
+            return
+
+        hex_str = self.hex_entry.get().strip()
+        if not hex_str:
+            return
+
+        # 去除空格、换行等空白字符，然后每两个字符解析为一个字节
+        hex_clean = hex_str.replace(" ", "").replace("\t", "").replace("\n", "")
+        if len(hex_clean) == 0:
+            return
+        if len(hex_clean) % 2 != 0:
+            messagebox.showwarning("HEX 格式错误",
+                                   "HEX 字符串长度必须为偶数（每两个字符表示一个字节）\n"
+                                   "正确示例: 41 42 43 或 414243")
+            return
+
+        try:
+            data = bytes.fromhex(hex_clean)
+        except ValueError as e:
+            messagebox.showwarning("HEX 格式错误",
+                                   f"无法解析 HEX 字符串:\n{e}")
+            return
+
+        self._serial_write(data)
+        # 发送后保留输入框内容不清空，方便重复发送
+        self.hex_entry.focus_set()
+
+    # ══════════════════════════════════════════════════════════
+    # 窗口生命周期
+    # ══════════════════════════════════════════════════════════
+
+    def _on_close(self) -> None:
+        self._close_serial()
+        self.root.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 程序入口
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    root = tk.Tk()
+    USARTKeyboardApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
